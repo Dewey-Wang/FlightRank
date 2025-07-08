@@ -15,6 +15,7 @@ def split_data_by_group_size(
     group_counts = (
         df.group_by("ranker_id")
           .agg(pl.count().alias("n_rows"))
+          .filter(pl.col("n_rows") >= bins[0])
     )
 
     bins_fixed = bins.copy()
