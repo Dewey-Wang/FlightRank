@@ -377,20 +377,32 @@ def load_used_features_from_importance_csv(
     回傳:
     - dict {label: features list}
     """
-    result = {}
-
-    for label in labels:
-        csv_path = os.path.join(model_importance_dir, f"feature_importance_{label}_all_features.csv")
+    if labels is None:
+        csv_path = os.path.join(model_importance_dir, f"feature_importance.csv")
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"找不到檔案: {csv_path}")
 
         df = pd.read_csv(csv_path)
 
         # 挑出min_rank < 9999代表有用到的feature
-        used_features = df["feature"].tolist()
+        result = df["feature"].tolist()
 
-        print(f"✅ {label}: 共 {len(used_features)} 個用到的特徵")
+        print(f"✅ 共 {len(result)} 個用到的特徵")
+    else:
+        result = {}
 
-        result[label] = used_features
+        for label in labels:
+            csv_path = os.path.join(model_importance_dir, f"feature_importance_{label}_all_features.csv")
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(f"找不到檔案: {csv_path}")
+
+            df = pd.read_csv(csv_path)
+
+            # 挑出min_rank < 9999代表有用到的feature
+            used_features = df["feature"].tolist()
+
+            print(f"✅ {label}: 共 {len(used_features)} 個用到的特徵")
+
+            result[label] = used_features
 
     return result
