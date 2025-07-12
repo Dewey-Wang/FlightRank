@@ -1,6 +1,7 @@
 import polars as pl
 import os
 import json
+import gc
 
 def split_data_by_group_size(
     df: pl.DataFrame,
