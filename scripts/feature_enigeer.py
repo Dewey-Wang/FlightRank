@@ -1365,3 +1365,166 @@ def merge_original_with_extra_features(
         print(f"🔹 新增欄位: {sorted(added_cols)}")
 
     return df
+
+import pickle
+import os
+import polars as pl
+from typing import Optional
+import json
+
+def enrich_flight_view_features(
+    df: pl.DataFrame,
+    output_dir: Optional[str] = None,
+    output_filename: str = "11_flight_view_features.parquet",
+    transform_config: Optional[dict] = None
+) -> tuple[pl.DataFrame, dict]:
+    def make_leg_segment_keys(leg_prefix):
+        keys = []
+        for i in range(4):
+            key_name = f"{leg_prefix}_segments{i}_key"
+            dep = pl.col(f"{leg_prefix}_segments{i}_departureFrom_airport_iata").fill_null("missing")
+            arr = pl.col(f"{leg_prefix}_segments{i}_arrivalTo_airport_iata").fill_null("missing")
+            keys.append((dep + "-" + arr).alias(key_name))
+        return keys
+
+    df = df.with_columns(make_leg_segment_keys("legs0") + make_leg_segment_keys("legs1"))
+
+    all_segments = [f"legs0_segments{i}_key" for i in range(4)] + [f"legs1_segments{i}_key" for i in range(4)]
+
+    if transform_config is None:
+        segment_counts = (
+            df.melt(id_vars=[], value_vars=all_segments)
+            .filter(pl.col("value") != "missing-missing")
+            .group_by("value")
+            .agg(pl.count().alias("segment_view_count"))
+        )
+        segment_counts_dict = segment_counts.to_dict(as_series=False)
+    else:
+        segment_counts = pl.DataFrame(transform_config["segment_counts"])
+
+    for seg_col in all_segments:
+        df = df.join(
+            segment_counts,
+            left_on=seg_col,
+            right_on="value",
+            how="left"
+        ).with_columns(
+            pl.col("segment_view_count").fill_null(0).alias(f"{seg_col}_view_count")
+        ).drop("segment_view_count")
+
+    def make_leg_full_key(leg_prefix):
+        seg_keys = [f"{leg_prefix}_segments{i}_key" for i in range(4)]
+        return pl.concat_str([pl.col(k) for k in seg_keys], separator="|").alias(f"{leg_prefix}_key")
+
+    df = df.with_columns([
+        make_leg_full_key("legs0"),
+        make_leg_full_key("legs1"),
+        (
+            pl.concat_str([
+                pl.concat_str([pl.col(f"legs0_segments{i}_key") for i in range(4)], separator="|"),
+                pl.lit("||"),
+                pl.concat_str([pl.col(f"legs1_segments{i}_key") for i in range(4)], separator="|"),
+            ], separator="")
+        ).alias("all_key")
+    ])
+
+    if transform_config is None:
+        leg0_counts = df.group_by("legs0_key").agg(pl.count().alias("leg0_flight_view_count"))
+        leg1_counts = df.group_by("legs1_key").agg(pl.count().alias("leg1_flight_view_count"))
+        all_counts = df.group_by("all_key").agg(pl.count().alias("all_flight_view_count"))
+        leg0_counts_dict = leg0_counts.to_dict(as_series=False)
+        leg1_counts_dict = leg1_counts.to_dict(as_series=False)
+        all_counts_dict = all_counts.to_dict(as_series=False)
+    else:
+        leg0_counts = pl.DataFrame(transform_config["leg0_counts"])
+        leg1_counts = pl.DataFrame(transform_config["leg1_counts"])
+        all_counts = pl.DataFrame(transform_config["all_counts"])
+
+    df = df.join(leg0_counts, on="legs0_key", how="left")
+    df = df.join(leg1_counts, on="legs1_key", how="left")
+    df = df.join(all_counts, on="all_key", how="left")
+
+    ranker_stats = df.group_by("ranker_id").agg([
+        pl.max("leg0_flight_view_count").alias("leg0_view_max"),
+        pl.max("leg1_flight_view_count").alias("leg1_view_max"),
+        pl.max("all_flight_view_count").alias("all_view_max"),
+    ])
+
+    df = df.join(ranker_stats, on="ranker_id", how="left")
+
+    df = df.with_columns([
+        (pl.col("leg0_flight_view_count") / (pl.col("leg0_view_max") + 1e-5)).alias("leg0_view_norm"),
+        (pl.col("leg1_flight_view_count") / (pl.col("leg1_view_max") + 1e-5)).alias("leg1_view_norm"),
+        (pl.col("all_flight_view_count") / (pl.col("all_view_max") + 1e-5)).alias("all_view_norm"),
+    ])
+
+    ranker_stats_mean = df.group_by("ranker_id").agg([
+        pl.mean("leg0_flight_view_count").alias("leg0_view_mean"),
+        pl.mean("leg1_flight_view_count").alias("leg1_view_mean"),
+        pl.mean("all_flight_view_count").alias("all_view_mean"),
+    ])
+
+    df = df.join(ranker_stats_mean, on="ranker_id", how="left")
+
+    df = df.with_columns([
+        (pl.col("leg0_flight_view_count") - pl.col("leg0_view_mean")).alias("leg0_view_diff_mean"),
+        (pl.col("leg1_flight_view_count") - pl.col("leg1_view_mean")).alias("leg1_view_diff_mean"),
+        (pl.col("all_flight_view_count") - pl.col("all_view_mean")).alias("all_view_diff_mean"),
+    ])
+
+    rank_features = [
+        "leg0_flight_view_count",
+        "leg1_flight_view_count",
+        "all_flight_view_count",
+    ] + [f"legs0_segments{i}_key_view_count" for i in range(4)] + [f"legs1_segments{i}_key_view_count" for i in range(4)]
+
+    rank_exprs = []
+    for col in rank_features:
+        rank_exprs.append(
+            pl.col(col).rank(method="dense").over("ranker_id").alias(f"{col}_rank")
+        )
+
+    df = df.with_columns(rank_exprs)
+
+    output_config = None
+    if transform_config is None:
+        output_config = {
+            "segment_counts": segment_counts_dict,
+            "leg0_counts": leg0_counts_dict,
+            "leg1_counts": leg1_counts_dict,
+            "all_counts": all_counts_dict
+        }
+
+    # 最後要 drop 的 columns
+    columns_to_drop = (
+        [
+            "leg0_view_max", "leg1_view_max", "all_view_max",
+            "leg0_view_mean", "leg1_view_mean", "all_view_mean",
+            "legs0_key", "legs1_key", "all_key"
+        ]
+        + [f"legs0_segments{i}_key" for i in range(4)]
+        + [f"legs1_segments{i}_key" for i in range(4)]
+        + [
+            f"{leg}_segments{i}_{x}_airport_iata"
+            for leg in ["legs0", "legs1"]
+            for i in range(4)
+            for x in ["departureFrom", "arrivalTo"]
+        ]
+    )
+    df = df.drop(columns_to_drop)
+
+    # 保留 Id 與所有新欄位
+    keep_cols = ["Id"] + [col for col in df.columns if col != "Id"]
+    df = df.select(keep_cols)
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        df.write_parquet(os.path.join(output_dir, output_filename))
+        print(f"✅ 已儲存flight view特徵: {os.path.join(output_dir, output_filename)}")
+        if transform_config is None and output_config is not None:
+            config_path = os.path.join(output_dir, "transform_flight_view_key_config.pkl")
+            with open(config_path, "wb") as f:
+                pickle.dump(output_config, f)
+            print(f"✅ 已儲存 transform_config: {config_path}")
+
+    return df, output_config
