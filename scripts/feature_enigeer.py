@@ -1528,3 +1528,254 @@ def enrich_flight_view_features(
             print(f"✅ 已儲存 transform_config: {config_path}")
 
     return df, output_config
+
+
+import polars as pl
+import os
+import pickle
+from typing import Optional, Tuple, Dict
+
+def build_company_loo_features(
+    df: pl.DataFrame,
+    output_dir: Optional[str] = None,
+    transform_dict: Optional[Dict] = None
+) -> Tuple[pl.DataFrame, Optional[Dict]]:
+    """
+    建立公司 LOO aggregation 特徵：
+    - 所有 mean 特徵：selected==1 且排除同 ranker_id
+    - mode 特徵：selected==1，不做 LOO
+    - 出現次數：所有紀錄，不做 LOO
+    - 當 companyID 未出現，使用全體均值 fallback
+    """
+    save_transform = transform_dict
+    target_col = "selected"
+    company_col = "companyID"
+    ranker_col = "ranker_id"
+
+    df = df.with_columns([
+        pl.col(target_col).cast(pl.Int8)
+    ])
+
+    # Duration轉分鐘
+    duration_cols = ["legs0_duration", "legs1_duration"]
+    duration_exprs = [
+        pl.when(pl.col(c).is_in([None, "missing"]))
+        .then(None)
+        .otherwise(
+            pl.col(c).str.extract(r"^(\d+):", 1).cast(pl.Int64) * 60 +
+            pl.col(c).str.extract(r":(\d+):", 1).cast(pl.Int64)
+        )
+        .alias(c)
+        for c in duration_cols
+    ]
+    df = df.with_columns(duration_exprs)
+
+    # 時間特徵
+    time_cols = ["legs0_departureAt", "legs0_arrivalAt", "legs1_departureAt", "legs1_arrivalAt"]
+    time_exprs = []
+    for col in time_cols:
+        cleaned_col = (
+            pl.when(pl.col(col).is_in(["missing", None, ""]))
+            .then(None)
+            .otherwise(pl.col(col))
+        )
+        dt = cleaned_col.str.to_datetime(strict=False)
+        h = dt.dt.hour()
+        time_exprs.append(
+            h.fill_null(-1).alias(f"{col}_hour")
+        )
+    df = df.with_columns(time_exprs)
+
+    # Cabin class
+    if "legs0_segments0_cabinClass" in df.columns:
+        df = df.with_columns(
+            pl.col("legs0_segments0_cabinClass").cast(pl.Float32).alias("cabin_class")
+        )
+    else:
+        df = df.with_columns(
+            pl.lit(None).alias("cabin_class")
+        )
+
+    # Transfer
+    df = df.with_columns([
+        pl.sum_horizontal([
+            ((pl.col(f"legs0_segments{i}_departureFrom_airport_iata").is_not_null()) &
+             (pl.col(f"legs0_segments{i}_departureFrom_airport_iata") != "missing")).cast(pl.Int8)
+            for i in range(1, 4)
+        ]).alias("legs0_num_transfers"),
+        pl.sum_horizontal([
+            ((pl.col(f"legs1_segments{i}_departureFrom_airport_iata").is_not_null()) &
+             (pl.col(f"legs1_segments{i}_departureFrom_airport_iata") != "missing")).cast(pl.Int8)
+            for i in range(1, 4)
+        ]).alias("legs1_num_transfers")
+    ])
+    df = df.with_columns([
+        (pl.col("legs0_num_transfers") + pl.col("legs1_num_transfers")).fill_null(0).cast(pl.Int64).alias("total_num_transfers"),
+        ((pl.col("legs0_num_transfers") + pl.col("legs1_num_transfers")) > 0).cast(pl.Int8).alias("has_transfer")
+    ])
+
+    agg_cols = [
+        "totalPrice", "taxes",
+        "legs0_duration", "legs1_duration",
+        "cabin_class",
+        "total_num_transfers"
+    ] + [f"{c}_hour" for c in time_cols]
+    
+    stats_cols = [company_col] + [f"{c}_mean" for c in agg_cols] + ["selected_count"]
+
+    if transform_dict is None:
+
+        # selected==1 mean
+        all_stats = (
+            df.filter(pl.col(target_col) == 1)
+            .group_by(company_col)
+            .agg([
+                *(pl.mean(c).alias(f"{c}_mean") for c in agg_cols),
+                pl.count().alias("selected_count")
+            ])
+        )
+
+        # 全體均值 fallback
+        global_mean_row = (
+            df.filter(pl.col(target_col) == 1)
+            .select([
+                pl.lit(-1).alias(company_col),
+                *(pl.mean(c).alias(f"{c}_mean") for c in agg_cols),
+                pl.count().alias("selected_count")
+            ])
+        )
+        # 確保欄位名稱和順序一致
+        global_mean_row = global_mean_row.select(all_stats.columns)
+
+        # 強制同順序
+
+
+        # mode
+        def mode_table(col, alias, dtype):
+            m = (
+                df.filter(pl.col(target_col)==1)
+                .group_by(company_col)
+                .agg([
+                    pl.col(col)
+                    .value_counts(sort=True)
+                    .struct.field(col)
+                    .first()
+                    .cast(dtype)
+                    .alias(alias)
+                ])
+            )
+            global_mode = (
+                df.filter(pl.col(target_col)==1)
+                .select([
+                    pl.col(col)
+                    .value_counts(sort=True)
+                    .struct.field(col)
+                    .first()
+                    .cast(dtype)
+                    .alias(alias)
+                ])
+                .with_columns(pl.lit(-1).alias(company_col))
+            )
+            return m, global_mode
+
+        cabin_mode, global_cabin = mode_table("cabin_class","mode_cabin_class",pl.Int32)
+        transfer_mode, global_transfer = mode_table("has_transfer","mode_has_transfer",pl.Int8)
+        transfer_num_mode, global_transfer_num = mode_table("total_num_transfers","mode_transfer_num",pl.Int64)
+
+        ranker_stats = (
+            df.filter(pl.col(target_col) == 1)
+            .group_by([ranker_col, company_col])
+            .agg([
+                *(pl.sum(c).alias(f"{c}_sum") for c in agg_cols),
+                pl.count().alias("count")
+            ])
+        )
+        total_counts = (
+            df.group_by(company_col)
+            .agg(pl.count().alias("total_occurrences"))
+        )
+
+        transform_dict = {
+            "all_stats": all_stats.to_dict(as_series=False),
+            "global_mean": global_mean_row.to_dict(as_series=False),
+            "cabin_mode": cabin_mode.to_dict(as_series=False),
+            "global_cabin": global_cabin.to_dict(as_series=False),
+            "transfer_mode": transfer_mode.to_dict(as_series=False),
+            "global_transfer": global_transfer.to_dict(as_series=False),
+            "transfer_num_mode": transfer_num_mode.to_dict(as_series=False),
+            "global_transfer_num": global_transfer_num.to_dict(as_series=False),
+            "ranker_stats": ranker_stats.to_dict(as_series=False),
+            "total_counts": total_counts.to_dict(as_series=False)
+        }
+    else:
+        all_stats = pl.DataFrame(transform_dict["all_stats"])
+        global_mean_row = pl.DataFrame(transform_dict["global_mean"])
+        global_mean_row = global_mean_row.select(stats_cols)
+
+        cabin_mode = pl.DataFrame(transform_dict["cabin_mode"])
+        global_cabin = pl.DataFrame(transform_dict["global_cabin"])
+        cabin_mode = cabin_mode.select([company_col, "mode_cabin_class"])
+        global_cabin = global_cabin.select([company_col, "mode_cabin_class"])
+
+        transfer_mode = pl.DataFrame(transform_dict["transfer_mode"])
+        global_transfer = pl.DataFrame(transform_dict["global_transfer"])
+        transfer_mode = transfer_mode.select([company_col, "mode_has_transfer"])
+        global_transfer = global_transfer.select([company_col, "mode_has_transfer"])
+
+        transfer_num_mode = pl.DataFrame(transform_dict["transfer_num_mode"])
+        global_transfer_num = pl.DataFrame(transform_dict["global_transfer_num"])
+        transfer_num_mode = transfer_num_mode.select([company_col, "mode_transfer_num"])
+        global_transfer_num = global_transfer_num.select([company_col, "mode_transfer_num"])
+
+        ranker_stats = pl.DataFrame(transform_dict["ranker_stats"])
+        total_counts = pl.DataFrame(transform_dict["total_counts"])
+
+        # concat global fallback row
+        all_stats = pl.concat([all_stats, global_mean_row])
+        cabin_mode = pl.concat([cabin_mode, global_cabin])
+        transfer_mode = pl.concat([transfer_mode, global_transfer])
+        transfer_num_mode = pl.concat([transfer_num_mode, global_transfer_num])
+
+
+    # join
+    df = df.join(all_stats, on=company_col, how="left")
+    df = df.join(cabin_mode, on=company_col, how="left")
+    df = df.join(transfer_mode, on=company_col, how="left")
+    df = df.join(transfer_num_mode, on=company_col, how="left")
+    df = df.join(ranker_stats, on=[ranker_col, company_col], how="left")
+    df = df.join(total_counts, on=company_col, how="left")
+
+    # LOO mean
+    new_cols = []
+    for c in agg_cols:
+        new_cols.append(
+                pl.col(f"{c}_mean").alias(f"{company_col}_loo_mean_{c}")
+        )
+    new_cols.append(
+            pl.col("selected_count").alias(f"{company_col}_loo_selected_count")
+        )
+
+    # mode 和 occurrence不變
+    new_cols.append(pl.col("mode_cabin_class").alias(f"{company_col}_mode_cabin_class"))
+    new_cols.append(pl.col("mode_has_transfer").alias(f"{company_col}_mode_has_transfer"))
+    new_cols.append(pl.col("mode_transfer_num").alias(f"{company_col}_mode_transfer_num"))
+    new_cols.append(pl.col("total_occurrences").alias(f"{company_col}_total_occurrences"))
+
+    df = df.with_columns(new_cols)
+
+    kept_cols = ["Id"] + [c.meta.output_name() for c in new_cols]
+    df = df.select(kept_cols)
+
+    # 儲存
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        df_path = os.path.join(output_dir, "12_companyID_features.parquet")
+        df.write_parquet(df_path)
+        print(f"✅ 已儲存 transform_dict: {df_path}")
+        if save_transform is None:
+            config_path = os.path.join(output_dir, "transform_dict_companyID.pkl")
+            with open(config_path, "wb") as f:
+                pickle.dump(transform_dict, f)
+            print(f"✅ 已儲存 transform_dict: {config_path}")
+
+    return df, transform_dict
