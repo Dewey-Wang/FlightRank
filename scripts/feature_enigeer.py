@@ -1471,7 +1471,7 @@ def enrich_flight_view_features(
         (pl.col("leg1_flight_view_count") - pl.col("leg1_view_mean")).alias("leg1_view_diff_mean"),
         (pl.col("all_flight_view_count") - pl.col("all_view_mean")).alias("all_view_diff_mean"),
     ])
-
+    
     rank_features = [
         "leg0_flight_view_count",
         "leg1_flight_view_count",
@@ -1938,3 +1938,42 @@ def add_cluster_features_and_save(
     print(df_joined.head())
     
     return df_joined
+
+
+import polars as pl
+def drop_constant_numeric_columns(
+    df: pl.DataFrame,
+    threshold: float = 1.0
+) -> pl.DataFrame:
+    """
+    檢查所有 numeric 欄位，若最常見值佔比 >= threshold，則移除該欄。
+    """
+    if not (0 < threshold <= 1.0):
+        raise ValueError("threshold 必須在 (0, 1]")
+
+    numeric_cols = [c for c, dtype in df.schema.items() if dtype in pl.NUMERIC_DTYPES]
+    if not numeric_cols:
+        print("⚠️ DataFrame 中沒有 numeric 欄位，無需檢查")
+        return df
+
+    columns_to_drop = []
+
+    for col in numeric_cols:
+        vc_df = (
+            df.select(pl.col(col).value_counts())
+            .unnest(col)
+            .sort(by=["count", col], descending=[True, False])
+        )
+        most_common_count = vc_df[0, "count"]
+        ratio = most_common_count / df.height
+        if ratio >= threshold:
+            print(f"🚮 欄位 {col} 最常見值佔比 {ratio:.4f} >= {threshold}, 將移除")
+            columns_to_drop.append(col)
+
+    if columns_to_drop:
+        df = df.drop(columns_to_drop)
+        print(f"✅ 已移除 {len(columns_to_drop)} 個幾乎無變化的 numeric 欄位: {columns_to_drop}")
+    else:
+        print("✅ 所有 numeric 欄位變異性足夠，無需刪除")
+    print(f"目前有{len(df.columns)}")
+    return df

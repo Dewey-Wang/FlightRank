@@ -2,7 +2,6 @@ import polars as pl
 import os
 import json
 import gc
-
 def split_data_by_group_size(
     df: pl.DataFrame,
     bins: list,
@@ -11,20 +10,11 @@ def split_data_by_group_size(
     label_features: dict = None,
     unused_label_features: dict = None
 ):
-    """
-    分群 + 分批寫檔 + 釋放記憶體。
-
-    df: polars.DataFrame
-    bins: 分群邊界
-    labels: 分群名稱
-    output_dir: 每個群的 parquet 儲存目錄
-    label_features: dict(label -> feature list)
-    unused_label_features: dict(label -> feature list)，要排除的欄位
-    """
     os.makedirs(output_dir, exist_ok=True)
 
     df = df.with_row_count("global_row_nr")
 
+    # 先計算每個ranker_id有幾筆
     group_counts = (
         df.group_by("ranker_id")
           .agg(pl.count().alias("n_rows"))
@@ -39,9 +29,10 @@ def split_data_by_group_size(
     if len(labels) != len(bins_fixed) - 1:
         raise ValueError(f"bins={bins_fixed} 有 {len(bins_fixed)-1}個區間，但labels數={len(labels)}")
 
+    # 計算每個 ranker_id 的 group label
     cond = (
         pl.when((pl.col("n_rows") >= bins_fixed[0]) & (pl.col("n_rows") < bins_fixed[1]))
-        .then(pl.lit(labels[0]))
+          .then(pl.lit(labels[0]))
     )
     for i in range(1, len(labels)):
         cond = cond.when(
@@ -49,48 +40,49 @@ def split_data_by_group_size(
         ).then(pl.lit(labels[i]))
     cond = cond.otherwise(pl.lit("unknown"))
 
-    group_counts = group_counts.with_columns([
-        cond.alias("group_category")
-    ])
+    group_counts = group_counts.with_columns(cond.alias("group_category"))
 
-    df = df.join(group_counts, on="ranker_id", how="left")
-
-    written_files = []
+    written_files = {}
     effective_label_features = {}
 
+    # 每個label一次處理
     for lbl in labels:
-        # 計算要用的特徵
-        if label_features is None:
-            feats = [c for c in df.columns if c != "group_category"]
-        else:
-            feats = label_features.get(lbl, [])
-
-        # 排除 unused features
-        if unused_label_features is not None:
-            if isinstance(unused_label_features, dict):
-                unused_feats = set(unused_label_features.get(lbl, []))
-            elif isinstance(unused_label_features, list):
-                unused_feats = set(unused_label_features)
-            else:
-                raise ValueError("unused_label_features 必須是 dict 或 list")
-
-            feats = [f for f in feats if f not in unused_feats]
-
-        # 記錄實際使用的特徵
-        effective_label_features[lbl] = feats
-
-        base_cols = ["selected", "ranker_id", "global_row_nr", "group_category"]
-        all_cols = feats + base_cols
-        all_cols = list(dict.fromkeys(all_cols))
-
-        # **方案1: 先select再filter**
-        subset = df.select([c for c in all_cols if c in df.columns]).filter(
-            pl.col("group_category") == lbl
+        # 先抓該label的ranker_id清單
+        rankers_this_label = (
+            group_counts
+            .filter(pl.col("group_category") == lbl)
+            .get_column("ranker_id")
+            .to_list()
         )
+        if not rankers_this_label:
+            print(f"⚠️ {lbl} 沒有資料，跳過")
+            continue
+
+        # 直接 filter
+        subset = df.filter(pl.col("ranker_id").is_in(rankers_this_label))
 
         if subset.is_empty():
             print(f"⚠️ {lbl} 沒有資料，跳過")
             continue
+
+        # 計算特徵
+        if label_features is None:
+            feats = [c for c in df.columns]
+        else:
+            feats = label_features.get(lbl, [])
+
+        if unused_label_features:
+            if isinstance(unused_label_features, dict):
+                unused_feats = set(unused_label_features.get(lbl, []))
+            else:
+                unused_feats = set(unused_label_features)
+            feats = [f for f in feats if f not in unused_feats]
+
+        effective_label_features[lbl] = feats
+
+        base_cols = ["selected", "ranker_id", "global_row_nr"]
+        all_cols = list(dict.fromkeys(feats + base_cols))
+        subset = subset.select([c for c in all_cols if c in subset.columns])
 
         mem_mb = subset.estimated_size() / (1024 * 1024)
         print(f"✅ {lbl}: {subset.height} rows, approx {mem_mb:.2f} MB")
@@ -98,11 +90,12 @@ def split_data_by_group_size(
         out_path = os.path.join(output_dir, f"{lbl}.parquet")
         subset.write_parquet(out_path)
         print(f"💾 已寫入 {out_path}")
-        written_files.append(out_path)
+        written_files[lbl] = out_path
 
         del subset
         gc.collect()
 
+    # 統計
     summary = (
         group_counts.group_by("group_category")
         .agg([
@@ -116,27 +109,20 @@ def split_data_by_group_size(
     print("✅ 分群統計：")
     print(summary)
 
-    result = {
-        "summary": summary,
-        "written_files": written_files
-    }
-    if unused_label_features is not None:
-        result["used_label_features"] = effective_label_features
-
-    # 先把實際bins固定
-    bins_to_save = bins_fixed
-
     grouping_config = {
-        "bins": bins_to_save,
+        "bins": bins_fixed,
         "labels": labels
     }
     config_path = os.path.join(output_dir, "grouping_config.json")
     with open(config_path, "w") as f:
         json.dump(grouping_config, f, indent=4)
-
     print(f"✅ 已儲存 grouping_config: {config_path}")
 
-    return result
+    return {
+        "summary": summary,
+        "written_files": written_files,
+        "used_label_features": effective_label_features
+    }
 
 
 
