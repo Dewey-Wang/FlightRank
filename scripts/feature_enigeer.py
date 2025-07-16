@@ -1779,3 +1779,162 @@ def build_company_loo_features(
             print(f"✅ 已儲存 transform_dict: {config_path}")
 
     return df, transform_dict
+
+import os
+import pickle
+import polars as pl
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.cluster import KMeans
+
+def build_cluster_transform_dict(
+    transform_path: str,
+    output_path: str,
+    k: int = 3
+):
+    """
+    從 transform_dict_companyID.pkl 讀取，進行 KMeans clustering，生成 cluster summary，並存成 transform_dict_cluster.pkl
+    """
+    # === 讀取 transform_dict ===
+    with open(transform_path, "rb") as f:
+        transform_dict = pickle.load(f)
+
+    all_stats = pl.DataFrame(transform_dict["all_stats"])
+    cabin_mode = pl.DataFrame(transform_dict["cabin_mode"])
+    transfer_mode = pl.DataFrame(transform_dict["transfer_mode"])
+    transfer_num_mode = pl.DataFrame(transform_dict["transfer_num_mode"])
+    total_counts = pl.DataFrame(transform_dict["total_counts"])
+    global_mean = pl.DataFrame(transform_dict["global_mean"])
+
+    # 加上 fallback row
+    all_stats = pl.concat([all_stats, global_mean])
+
+    # 合併成 summary
+    company_summary = (
+        all_stats
+        .join(cabin_mode, on="companyID", how="left")
+        .join(transfer_mode, on="companyID", how="left")
+        .join(transfer_num_mode, on="companyID", how="left")
+        .join(total_counts, on="companyID", how="left")
+    )
+
+    # Null -> 0
+    company_summary_filled = company_summary.fill_null(0)
+
+    # Numeric columns
+    exclude_cols = {"companyID"}
+    numeric_cols = [
+        c for c, dtype in company_summary_filled.schema.items()
+        if c not in exclude_cols and dtype in pl.NUMERIC_DTYPES
+    ]
+
+    # Scaling
+    X_np = company_summary_filled.select(numeric_cols).to_numpy()
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X_np)
+
+    # Clustering
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    labels = kmeans.fit_predict(X_scaled)
+
+    company_summary_clustered = company_summary_filled.with_columns(
+        pl.Series("cluster_label", labels)
+    )
+
+    # 聚合每個 cluster
+    base_features = [c for c in company_summary_clustered.columns if c not in {"companyID", "cluster_label"}]
+    agg_exprs = [
+        pl.col(feat).mean().alias(f"{feat}_mean") for feat in base_features
+    ]
+
+    cluster_summary = (
+        company_summary_clustered
+        .group_by("cluster_label")
+        .agg(agg_exprs)
+        .sort("cluster_label")
+    )
+
+    # Merge cluster summary back
+    company_with_cluster_features = (
+        company_summary_clustered
+        .join(cluster_summary, on="cluster_label", how="left")
+    )
+
+    final_df = company_with_cluster_features.select(
+        ["companyID", "cluster_label"] + cluster_summary.drop("cluster_label").columns
+    )
+
+    # 儲存 transform_dict
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    cluster_transform_dict = {
+        "cluster_summary": final_df.to_dict(as_series=False)
+    }
+
+    with open(output_path, "wb") as f:
+        pickle.dump(cluster_transform_dict, f)
+
+    print(f"✅ 已儲存 transform_dict: {output_path}")
+    
+    return cluster_transform_dict
+
+
+import os
+import pickle
+import polars as pl
+
+import os
+import pickle
+import polars as pl
+import os
+import pickle
+import polars as pl
+
+def add_cluster_features_and_save(
+    df: pl.DataFrame,
+    transform_dict_path: str,
+    output_dir: str
+):
+    """
+    根據 transform_dict (cluster) 對應 companyID 加入 cluster features，若找不到則用 fallback (-1)。
+    
+    Args:
+        df: 要加上 features 的 DataFrame (必須有 "companyID")
+        transform_dict_path: transform_dict_cluster.pkl 路徑
+        output_dir: 輸出目錄
+    """
+    if "companyID" not in df.columns:
+        raise ValueError("❌ DataFrame 缺少 'companyID' 欄位")
+    
+    # 讀取 transform_dict
+    with open(transform_dict_path, "rb") as f:
+        transform_dict = pickle.load(f)
+    
+    cluster_features_df = pl.DataFrame(transform_dict["cluster_summary"])
+    
+    # fallback row
+    fallback_row = cluster_features_df.filter(pl.col("companyID") == -1)
+    
+    # 對 df 先 left join cluster_features
+    df_joined = df.join(
+        cluster_features_df,
+        on="companyID",
+        how="left"
+    )
+
+    # 再依序對每個欄 coalesce() fallback
+    feature_cols = [c for c in cluster_features_df.columns if c != "companyID"]
+    for col in feature_cols:
+        fallback_value = fallback_row[col].to_numpy()[0] if fallback_row.height else None
+        df_joined = df_joined.with_columns(
+            pl.col(col).fill_null(fallback_value)
+        )
+
+    # 輸出
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "13_cluster_features.parquet")
+    df_joined.write_parquet(output_path)
+    
+    print(f"✅ 已儲存 cluster features: {output_path}")
+    print(df_joined.head())
+    
+    return df_joined

@@ -1,6 +1,7 @@
 import polars as pl
 
-def compute_hitrate_at_3(groups_np, labels_np, preds_np, min_group_size=10, max_group_size=None):
+
+def compute_hitrate_at_3(groups_np, labels_np, preds_np,top =3, min_group_size=10, max_group_size=None):
     """
     計算 HitRate@3，可自訂 group size 範圍
     參數:
@@ -38,7 +39,7 @@ def compute_hitrate_at_3(groups_np, labels_np, preds_np, min_group_size=10, max_
         val_df.filter(pl.col("label") == 1)
               .join(group_size_df, on="ranker_id")
               .with_columns([
-                  (pl.col("rank_in_group") <=3).cast(pl.Int8).alias("is_hit")
+                  (pl.col("rank_in_group") <=top).cast(pl.Int8).alias("is_hit")
               ])
     )
 

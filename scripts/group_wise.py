@@ -59,12 +59,6 @@ def split_data_by_group_size(
     effective_label_features = {}
 
     for lbl in labels:
-        subset = df.filter(pl.col("group_category") == lbl)
-
-        if subset.is_empty():
-            print(f"⚠️ {lbl} 沒有資料，跳過")
-            continue
-
         # 計算要用的特徵
         if label_features is None:
             feats = [c for c in df.columns if c != "group_category"]
@@ -79,20 +73,24 @@ def split_data_by_group_size(
                 unused_feats = set(unused_label_features)
             else:
                 raise ValueError("unused_label_features 必須是 dict 或 list")
-            
-            # ⚠️ 把這行補回來：實際刪除
+
             feats = [f for f in feats if f not in unused_feats]
-
-
 
         # 記錄實際使用的特徵
         effective_label_features[lbl] = feats
 
-        base_cols = ["selected", "ranker_id", "global_row_nr"]
+        base_cols = ["selected", "ranker_id", "global_row_nr", "group_category"]
         all_cols = feats + base_cols
         all_cols = list(dict.fromkeys(all_cols))
 
-        subset = subset.select([c for c in all_cols if c in subset.columns])
+        # **方案1: 先select再filter**
+        subset = df.select([c for c in all_cols if c in df.columns]).filter(
+            pl.col("group_category") == lbl
+        )
+
+        if subset.is_empty():
+            print(f"⚠️ {lbl} 沒有資料，跳過")
+            continue
 
         mem_mb = subset.estimated_size() / (1024 * 1024)
         print(f"✅ {lbl}: {subset.height} rows, approx {mem_mb:.2f} MB")
@@ -128,7 +126,6 @@ def split_data_by_group_size(
     # 先把實際bins固定
     bins_to_save = bins_fixed
 
-    # 寫檔
     grouping_config = {
         "bins": bins_to_save,
         "labels": labels
@@ -140,6 +137,7 @@ def split_data_by_group_size(
     print(f"✅ 已儲存 grouping_config: {config_path}")
 
     return result
+
 
 
 def split_data_by_group_size_test(
@@ -539,7 +537,6 @@ def load_used_features_from_importance_csv(
 
             df = pd.read_csv(csv_path)
 
-            # 挑出min_rank < 9999代表有用到的feature
             used_features = df["feature"].tolist()
 
             print(f"✅ {label}: 共 {len(used_features)} 個用到的特徵")
@@ -547,3 +544,114 @@ def load_used_features_from_importance_csv(
             result[label] = used_features
 
     return result
+
+import os
+import pandas as pd
+
+def load_label_features(
+    model_dir: str,
+    split_labels: list,
+    top_n: int | list | None = None
+):
+    """
+    從模型資料夾讀取每個分群的特徵重要性檔案，回傳每個label的features list。
+
+    參數:
+    - model_dir: 模型資料夾
+    - split_labels: 分群名稱list
+    - top_n: int 或 list，如果指定，取前N個特徵（list時每個label不同）；否則用第一個min_rank=9999為止
+
+    回傳:
+    - dict(label -> features list)
+    """
+    label_features = {}
+
+    # 檢查 top_n
+    if isinstance(top_n, list):
+        if len(top_n) != len(split_labels):
+            raise ValueError(f"如果 top_n 是 list，長度必須與 split_labels 一致 (got {len(top_n)} vs {len(split_labels)})")
+
+    for i, label in enumerate(split_labels):
+        model_importance_dir = os.path.join(model_dir, "model_importance")
+        csv_path = os.path.join(model_importance_dir, f"feature_importance_{label}_all_features.csv")
+
+        df = pd.read_csv(csv_path)
+
+        # 決定這個label要用幾個
+        n = None
+        if isinstance(top_n, int):
+            n = top_n
+        elif isinstance(top_n, list):
+            n = top_n[i]
+
+        if n is not None:
+            feats = df.iloc[:n]["feature"].tolist()
+            print(f"\n✅ {label}: 取前 {n} 個特徵")
+        else:
+            idx_first_unused = df[df["min_rank"] == 9999].index.min()
+            feats = df.iloc[:idx_first_unused]["feature"].tolist()
+            print(f"\n✅ {label}: 第 {idx_first_unused} 名後都是完全未使用的特徵")
+            print("✅ 第一個未使用特徵：")
+            print(df.iloc[idx_first_unused])
+
+        label_features[label] = feats
+
+    # 印出所有分群features數量
+    for label in split_labels:
+        print(f"{label}: {len(label_features[label])} features")
+
+    return label_features
+
+
+
+import os
+import polars as pl
+
+def export_submission_parquets(
+    test_filled_with_preds: pl.DataFrame,
+    output_dir: str,
+    raw_filename: str = "raw_submission.parquet",
+    ranked_filename: str = "rank_submission.parquet"
+):
+    """
+    根據 test_filled_with_preds 輸出兩個 parquet:
+    1. 原始分數 (selected)
+    2. rank 排序 (selected)
+    """
+    # 檢查目錄
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Subset + __index_level_0__
+    subset_df = (
+        test_filled_with_preds
+        .select(["Id", "ranker_id", "selected"])
+        .with_columns(
+            pl.col("Id").alias("__index_level_0__")
+        )
+        .with_columns([
+            pl.col("Id").cast(pl.Int64),
+            pl.col("ranker_id").cast(pl.Utf8),
+            pl.col("selected").cast(pl.Float64),
+            pl.col("__index_level_0__").cast(pl.Int64)
+        ])
+    )
+
+    # 儲存原始 parquet
+    raw_path = os.path.join(output_dir, raw_filename)
+    subset_df.write_parquet(raw_path)
+    print(f"✅ 已儲存原始 submission: {raw_path}")
+    print(subset_df)
+
+    # Rank 排名
+    ranked_df = subset_df.with_columns(
+        pl.col("selected")
+          .rank(method="ordinal", descending=True)
+          .over("ranker_id")
+          .alias("selected")
+    )
+
+    # 儲存排名 parquet
+    ranked_path = os.path.join(output_dir, ranked_filename)
+    ranked_df.write_parquet(ranked_path)
+    print(f"✅ 已儲存rank submission: {ranked_path}")
+    print(ranked_df)
