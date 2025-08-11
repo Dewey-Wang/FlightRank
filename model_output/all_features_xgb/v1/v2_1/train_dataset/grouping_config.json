@@ -1,0 +1,15 @@
+{
+    "bins": [
+        4,
+        212,
+        517,
+        1200,
+        8237
+    ],
+    "labels": [
+        "small",
+        "medium",
+        "large",
+        "xlarge"
+    ]
+}
