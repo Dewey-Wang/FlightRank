@@ -44,7 +44,7 @@ def compute_hitrate_at_3(groups_np, labels_np, preds_np,top =3, min_group_size=1
     )
 
     # 篩選 group size
-    cond = pl.col("group_size") >= min_group_size
+    cond = pl.col("group_size") > min_group_size
     if max_group_size is not None:
         cond = cond & (pl.col("group_size") <= max_group_size)
     hit_filtered = hit_df.filter(cond)
