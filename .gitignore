@@ -211,4 +211,6 @@ __marimo__/
 
 data/
 
-**/**.parquet
+**/**.parquetmodel_output/
+*.pkl
+*.bin
