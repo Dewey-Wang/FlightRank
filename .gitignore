@@ -214,3 +214,4 @@ data/
 **/**.parquetmodel_output/
 *.pkl
 *.bin
+model_output/**/**.parquet
