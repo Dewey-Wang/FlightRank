@@ -211,7 +211,7 @@ __marimo__/
 
 data/
 
-**/**.parquetmodel_output/
-*.pkl
-*.bin
+**/**.parquet
+model_output/**/*.pkl
+model_output/**/*.bin
 model_output/**/**.parquet
